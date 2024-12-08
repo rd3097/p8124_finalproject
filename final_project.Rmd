@@ -1,0 +1,195 @@
+---
+title: "p8124_Finalproject"
+author: "Ruoying Deng"
+date: "2024-12-05"
+output: html_document
+---
+
+```{r}
+#Necessary Library
+library(dplyr)
+library(glasso)
+library(igraph)
+library(caret)
+library(randomForest)
+library(corrplot)
+```
+
+```{r}
+phenotypic <- read.csv("phenotypic_CMU.csv")
+dos160 <- read.csv("dos160_labels.csv")
+```
+
+```{r}
+asd_people <-phenotypic%>%
+  filter(DX_GROUP == 1)
+
+control_people <- phenotypic%>%
+  filter(DX_GROUP == 2)
+```
+
+```{r}
+#based on id, filter files into two folder asd/control
+asd_files <- list.files(path = "ASD", pattern = "*.csv", full.names = TRUE)
+
+read_file <- function(file) {
+  read.table(file, sep="", header=FALSE, fill=TRUE)
+}
+data_list <- lapply(asd_files, read_file)
+asd_data <- do.call(rbind, data_list)
+```
+
+```{r}
+control_files <- list.files(path = "control",pattern = "*.csv", full.names = TRUE)
+
+data_list2 <- lapply(control_files, read_file)
+control_data<-do.call(rbind, data_list2)
+```
+
+```{r}
+# remove ROI 161
+cl_asd_data <- asd_data%>%
+  select(-V161)
+
+cl_control_data <- control_data%>%
+  select(-V161)
+
+# check for missing
+cl_control_data <- na.omit(cl_control_data)
+cl_asd_data <- na.omit(cl_asd_data)
+
+```
+
+```{r}
+normalize_min_max <- function(data) {
+  return((data - min(data, na.rm = TRUE)) / (max(data, na.rm = TRUE) - min(data, na.rm = TRUE)))
+}
+
+# Apply normalization to all columns in a data frame
+normalized_asd_data <- as.data.frame(lapply(cl_asd_data, normalize_min_max))
+normalized_control_data <-as.data.frame(lapply(cl_control_data,normalize_min_max))
+
+```
+
+
+```{r}
+# Estimate sparse inverse covariance matrices
+estimate_precision_matrix <- function(data, lambda = 0.1) {
+  cov_matrix <- cov(data)
+  glasso_result <- glasso(cov_matrix, rho = lambda)
+  return(glasso_result$wi) # Precision matrix
+}
+
+precision_matrix_asd <- estimate_precision_matrix(normalized_asd_data)
+precision_matrix_control <- estimate_precision_matrix(normalized_control_data)
+```
+
+```{r}
+# Compute pairwise Pearson correlations
+correlation_matrix_asd <- cor(normalized_asd_data)
+
+correlation_matrix_control <- cor(normalized_control_data)
+```
+
+```{r}
+# Helper function to create a graph from adjacency matrix and compute metrics
+compute_graph_metrics <- function(adjacency_matrix) {
+  graph <- graph_from_adjacency_matrix(adjacency_matrix, mode = "undirected", weighted = TRUE, diag = FALSE)
+  sparsity <- mean(degree(graph) == 0)
+  modularity <- modularity(cluster_fast_greedy(graph))
+  clustering_coeff <- transitivity(graph, type = "global")
+  
+  return(list(
+    graph = graph,
+    sparsity = sparsity,
+    modularity = modularity,
+    clustering_coefficient = clustering_coeff
+  ))
+}
+
+# Compute metrics for GGM-based networks
+ggm_metrics_asd <- compute_graph_metrics(precision_matrix_asd != 0)
+ggm_metrics_control <- compute_graph_metrics(precision_matrix_control != 0)
+
+# Compute metrics for correlation-based networks
+cor_metrics_asd <- compute_graph_metrics(abs(correlation_matrix_asd) > 0.5)
+cor_metrics_control <- compute_graph_metrics(abs(correlation_matrix_control) > 0.5)
+
+```
+
+## Classification
+### Feature Extraction
+```{r}
+# Extract graph-based features
+extract_features <- function(graph_metrics) {
+  return(data.frame(
+    sparsity = graph_metrics$sparsity,
+    modularity = graph_metrics$modularity,
+    clustering_coefficient = graph_metrics$clustering_coefficient
+  ))
+}
+
+features_asd <- extract_features(ggm_metrics_asd)
+features_control <- extract_features(ggm_metrics_control)
+
+# t-tests for each metric
+t.test(features_asd$sparsity, features_control$sparsity)
+t.test(features_asd$modularity, features_control$modularity)
+t.test(features_asd$clustering_coefficient, features_control$clustering_coefficient)
+```
+
+### Random Forest Classification
+```{r}
+# Combine features and labels
+features <- rbind(features_asd, features_control)
+labels <- c(rep("ASD", nrow(features_asd)), rep("Control", nrow(features_control)))
+
+print(labels)
+dim(features)  # Number of rows and columns in the features dataset
+length(labels)  # Length of the labels vector
+
+
+
+# Train/test split
+set.seed(123)
+train_index <- createDataPartition(labels, p = 0.8, list = FALSE)
+train_data <- features[train_index, ]
+test_data <- features[-train_index, ]
+train_labels <- labels[train_index]
+test_labels <- labels[-train_index]
+
+# Train Random Forest classifier
+rf_model <- randomForest(x = train_data, y = as.factor(train_labels), ntree = 100)
+
+# Evaluate performance
+predictions <- predict(rf_model, newdata = test_data)
+confusion_matrix <- confusionMatrix(predictions, as.factor(test_labels))
+print(confusion_matrix)
+```
+## Statistical Analysis
+```{r}
+# Compare graph metrics between ASD and controls
+t_test_results <- data.frame(
+  metric = c("sparsity", "modularity", "clustering_coefficient"),
+  p_value = c(
+    t.test(features_asd$sparsity, features_control$sparsity)$p.value,
+    t.test(features_asd$modularity, features_control$modularity)$p.value,
+    t.test(features_asd$clustering_coefficient, features_control$clustering_coefficient)$p.value
+  )
+)
+
+print(t_test_results)
+```
+
+## Visualization
+```{r}
+corrplot(correlation_matrix_asd, method = "color", title = "ASD Correlation Matrix")
+corrplot(correlation_matrix_control, method = "color", title = "Control Correlation Matrix")
+```
+
+```{r}
+plot(ggm_metrics_asd$graph, main = "ASD GGM Network")
+plot(ggm_metrics_control$graph, main = "Control GGM Network")
+
+```
+
